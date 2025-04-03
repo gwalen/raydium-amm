@@ -1,6 +1,7 @@
 //! State transition types
 
 use crate::{error::AmmError, math::Calculator};
+use num_traits::{abs, abs_sub};
 use serum_dex::state::ToAlignedBytes;
 use solana_program::{
     account_info::AccountInfo,
@@ -1015,9 +1016,171 @@ impl GetSwapBaseOutData {
     }
 }
 
+// This account will have a seed : ["twap", token_a.key(), token_b.key()] where token_a.name > token_b.name (need to have well defined ordering)
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TwapData {
+    // ring buffer used to store last 20 entries of cumulative price
+    pub price_history: [PriceHistoryEntry; TwapData::RING_LEN],
+    pub price_history_idx: usize
+}
+impl_loadable!(TwapData);
+
+impl TwapData {
+    pub const RING_LEN: usize = 20;
+    pub const FEE_DENOMINATOR_PERCENT: u64 = 100;
+
+    pub fn add_price_to_history(&mut self, current_price: u64, current_timestamp: u64) {
+        let mut idx = self.price_history_idx;
+        let last = self.price_history[idx];
+        // first entry (in history)
+        if last == PriceHistoryEntry::default() {
+            self.price_history[idx] = PriceHistoryEntry {
+                timestamp: current_timestamp,
+                cumulative_price: 0
+            }
+        } else {
+            idx = Self::next_idx(idx);
+            let time_elapsed = current_timestamp - last.timestamp;
+            let new_cumulative_price = last.cumulative_price + current_price * time_elapsed;
+            self.price_history[idx] = PriceHistoryEntry {
+                timestamp: current_timestamp,
+                cumulative_price: new_cumulative_price
+            }
+        }
+
+        self.price_history_idx = idx;
+    }
+
+    pub fn get_twap_10min(&self) -> u64 {
+        let mut twap = 0;
+
+        let time_distance_sec = 10 * 60; // 10 minutes
+        let closest_entry = self.find_closest_history_entry(time_distance_sec, self.price_history[self.price_history_idx].timestamp);
+        if let Some(entry) = closest_entry {
+            let current_entry = self.price_history[self.price_history_idx];
+            twap = (current_entry.cumulative_price - entry.cumulative_price) / (current_entry.timestamp - entry.timestamp);
+        }
+
+        twap
+    }
+
+    fn next_idx(idx: usize) -> usize {
+        if idx + 1 == TwapData::RING_LEN {
+            0
+        } else {
+            idx + 1
+        }
+    } 
+
+    pub fn find_closest_history_entry(&self, time_distance_sec: u64, current_timestamp: u64) -> Option<PriceHistoryEntry> {
+        let timestamp_in_past = current_timestamp - time_distance_sec;
+        let mut closest_entry = None;
+        let mut smallest_time_diff = u64::MAX;
+
+        // Iterate through the ring buffer
+        for entry in self.price_history.iter() {
+            if entry.timestamp == 0 {
+                continue; // Skip empty entries
+            }
+
+            let time_diff = Self::time_dist_abs(timestamp_in_past, entry);
+
+            if time_diff < smallest_time_diff {
+                smallest_time_diff = time_diff;
+                closest_entry = Some(*entry);
+            }
+        }
+
+        closest_entry
+    }
+
+    fn time_dist_abs(timestamp_in_past: u64, entry: &PriceHistoryEntry) -> u64 {
+        Self::abs_sub(timestamp_in_past, entry.timestamp)
+    }
+
+    pub fn calculate_dynamic_fee(twap_price: u64, current_price: u64) -> u64 {
+        // Avoid division by zero
+        if twap_price == 0 {
+            return 100; // Default to highest fee: 1%
+        }
+    
+        let diff = Self::abs_sub(current_price, twap_price);
+    
+        // Compute the percentage difference in basis points:
+        // (diff / twap_price) * 10,000 (to convert into basis points)
+        let percent_diff_bps = diff
+            .checked_mul(10_000)
+            .and_then(|v| v.checked_div(twap_price))
+            .unwrap_or(u64::MAX);
+    
+        if percent_diff_bps < 50 {
+            // If the difference is less than 0.5%
+            5 // 0.05%
+        } else if percent_diff_bps <= 149 {
+            // If the difference is between 0.5% and 1.5%
+            30 // 0.3%
+        } else {
+            // If the difference is greater than 1.5%
+            100 // 1%
+        }
+    }
+
+    fn abs_sub(t1: u64, t2: u64) -> u64 {
+        if t1 > t2 {
+            t1 - t2
+        } else {
+            t2 - t1
+        }
+    }
+
+    /// Helper function to get the more efficient packed size of the struct
+    /// load_mut_checked
+    #[inline]
+    pub fn load_mut_checked<'a>(
+        account: &'a AccountInfo,
+        program_id: &Pubkey,
+    ) -> Result<RefMut<'a, Self>, ProgramError> {
+        if account.owner != program_id {
+            return Err(AmmError::InvalidOwner.into());
+        }
+        if account.data_len() != size_of::<Self>() {
+            return Err(AmmError::ExpectedAccount.into());
+        }
+        let data = Self::load_mut(account)?;
+        Ok(data)
+    }
+
+    /// load_checked
+    #[inline]
+    pub fn load_checked<'a>(
+        account: &'a AccountInfo,
+        program_id: &Pubkey,
+    ) -> Result<Ref<'a, Self>, ProgramError> {
+        if account.owner != program_id {
+            return Err(AmmError::InvalidOwner.into());
+        }
+        if account.data_len() != size_of::<Self>() {
+            return Err(AmmError::ExpectedAccount.into());
+        }
+        let data = Self::load(account)?;
+        Ok(data)
+    }
+}
+
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PriceHistoryEntry {
+    pub timestamp: u64,
+    pub cumulative_price: u64
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    
 
     #[test]
     fn test_amm_info_layout() {
@@ -1539,5 +1702,117 @@ mod test {
         }
         let unpack_free_slot_bits = unpack_data.free_slot_bits;
         assert_eq!(free_slot_bits, unpack_free_slot_bits);
+    }
+
+    #[test]
+    fn test_twap_data_ring_buffer() {
+        // Test add_price_to_history
+        let mut twap_data = TwapData::default();
+        
+        // Test first entry
+        twap_data.add_price_to_history(100, 1000);
+        let idx = twap_data.price_history_idx;
+        assert_eq!(idx, 0);
+        let entry0 = twap_data.price_history[0];
+        let timestamp = entry0.timestamp;
+        let cumulative_price = entry0.cumulative_price;
+        assert_eq!(timestamp, 1000);
+        assert_eq!(cumulative_price, 0);
+        
+        // Test second entry
+        twap_data.add_price_to_history(150, 1060);
+        let idx = twap_data.price_history_idx;
+        assert_eq!(idx, 1);
+        let entry1 = twap_data.price_history[1];
+        let timestamp = entry1.timestamp;
+        let cumulative_price = entry1.cumulative_price;
+        assert_eq!(timestamp, 1060);
+        // 0 + 150 * (1060 - 1000) = 9000
+        assert_eq!(cumulative_price, 9000);
+        
+        // Test third entry
+        twap_data.add_price_to_history(200, 1120);
+        let idx = twap_data.price_history_idx;
+        assert_eq!(idx, 2);
+        let entry2 = twap_data.price_history[2];
+        let timestamp = entry2.timestamp;
+        let cumulative_price = entry2.cumulative_price;
+        assert_eq!(timestamp, 1120);
+        // 9000 + 200 * (1120 - 1060) = 21000
+        assert_eq!(cumulative_price, 21000);
+        
+        // Test ring buffer wrap around
+        for i in 3..TwapData::RING_LEN + 2 {
+            let timestamp = 1120 + (i as u64) * 60;
+            let price = 200 + (i as u64) * 10;
+            twap_data.add_price_to_history(price, timestamp);
+        }
+        
+        // Should have wrapped around
+        let idx = twap_data.price_history_idx;
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_twap_closest_entry() {
+        // Test find_closest_history_entry
+        let mut twap_data = TwapData::default();
+        
+        // Add some sample data
+        twap_data.add_price_to_history(100, 1000); // Entry 0 
+        twap_data.add_price_to_history(110, 1300); // Entry 1 + 300s == 5 minutes
+        twap_data.add_price_to_history(120, 1600); // Entry 2 + 600s == 10 minutes
+        twap_data.add_price_to_history(130, 1900); // Entry 3 + 900s == 15 minutes
+        
+        // Test finding the closest entry to 5 minutes (300 seconds) ago from timestamp 1900
+        let time_distance_sec = 300;
+        let current_timestamp = 1900;
+        
+        let closest_entry_opt = twap_data.find_closest_history_entry(time_distance_sec, current_timestamp);
+        assert!(closest_entry_opt.is_some());
+        let closest_entry = closest_entry_opt.unwrap();
+        
+        // The closest entry should be the one at timestamp 1600 (Entry 2)
+        // NOTE: use identity to unpack value from struct and give it a proper alignment
+        assert_eq!(identity(closest_entry.timestamp), 1600);
+        
+        // Test finding closest entry to 8 minutes ago from current timestamp 1900
+        // Target would be 1900 - 480 = 1420, closest is Entry 1 at 1300
+        let closest_entry_opt = twap_data.find_closest_history_entry(480, 1900);
+        assert!(closest_entry_opt.is_some());
+        let closest_entry = closest_entry_opt.unwrap();
+        assert_eq!(identity(closest_entry.timestamp), 1300);
+    }
+
+    #[test]
+    fn test_twap_price_calculation() {
+        let mut twap_data = TwapData::default();
+        let base_timestamp = 10000;
+        let base_price = 500;
+        
+        // Add 11 samples with 1 min interval (first sample is 0, total covering 10 minutes)
+        for i in 0..11 {
+            let timestamp = base_timestamp + i * 60; // 1 minute intervals
+            let price = base_price + i * 10; // price increasing by 10 each time
+            twap_data.add_price_to_history(price, timestamp);
+        }
+        
+        // Calculate the expected cumulative price by hand to compare
+        let mut expected_cumulative = 0;
+        // iterate 10 times because 0 is the base entry (in total without 0 there must be 10 entries)
+        // first sample is 0
+        for i in 1..11 {
+            let price = base_price + i * 10;
+            expected_cumulative += price * 60;
+        }
+        
+        // TWAP should be the average price over 10 minutes
+        // This can be calculated as: total_price_time / total_time
+        let expected_twap = expected_cumulative / 600;
+        
+        // Check if the calculated TWAP matches our expectation
+        let calculated_twap = twap_data.get_twap_10min();
+        assert_eq!(calculated_twap, expected_twap);
+        assert_eq!(calculated_twap, 555);        
     }
 }

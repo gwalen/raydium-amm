@@ -13,9 +13,7 @@ use crate::{
         U128, U256,
     },
     state::{
-        AmmConfig, AmmInfo, AmmParams, AmmResetFlag, AmmState, AmmStatus, GetPoolData,
-        GetSwapBaseInData, GetSwapBaseOutData, Loadable, RunCrankData, SimulateParams,
-        TargetOrders, MAX_ORDER_LIMIT, TEN_THOUSAND,
+        AmmConfig, AmmInfo, AmmParams, AmmResetFlag, AmmState, AmmStatus, GetPoolData, GetSwapBaseInData, GetSwapBaseOutData, Loadable, RunCrankData, SimulateParams, TargetOrders, TwapData, MAX_ORDER_LIMIT, TEN_THOUSAND
     },
 };
 
@@ -2249,6 +2247,9 @@ impl Processor {
         let user_source_info = next_account_info(account_info_iter)?;
         let user_destination_info = next_account_info(account_info_iter)?;
         let user_source_owner = next_account_info(account_info_iter)?;
+
+        let twap_info = next_account_info(account_info_iter)?;
+
         if !user_source_owner.is_signer {
             return Err(AmmError::InvalidSignAccount.into());
         }
@@ -2390,10 +2391,23 @@ impl Processor {
             });
             return Err(AmmError::InsufficientFunds.into());
         }
+
+        let mut dynamic_fee = 0;
+        // check if twap account is initialized
+        if !twap_info.data_is_empty() {
+            // TODO: check twap account address is correct using PDA address generated for given seed
+            let twap_data = TwapData::load_checked(twap_info, program_id)?;
+            let twap_10min = twap_data.get_twap_10min();
+            let cur_price = Self::calculate_price(total_pc_without_take_pnl, total_coin_without_take_pnl, &amm);
+
+            dynamic_fee = TwapData::calculate_dynamic_fee(twap_10min, cur_price);
+        }
+        
+        // use dynamic fee instead of static fee
         let swap_fee = U128::from(swap.amount_in)
-            .checked_mul(amm.fees.swap_fee_numerator.into())
+            .checked_mul(dynamic_fee.into())
             .unwrap()
-            .checked_ceil_div(amm.fees.swap_fee_denominator.into())
+            .checked_ceil_div(100.into())
             .unwrap()
             .0;
         let swap_in_after_deduct_fee = U128::from(swap.amount_in).checked_sub(swap_fee).unwrap();
@@ -2664,6 +2678,8 @@ impl Processor {
             return Err(AmmError::InvalidSignAccount.into());
         }
 
+        let twap_info = next_account_info(account_info_iter)?;
+
         check_assert_eq!(
             *token_program_info.key,
             spl_token::id(),
@@ -2798,15 +2814,27 @@ impl Processor {
             total_coin_without_take_pnl.into(),
             swap_direction,
         );
+
+        let mut dynamic_fee = 0;
+        // check if twap account is initialized
+        if !twap_info.data_is_empty() {
+            // TODO: check twap account address is correct using PDA address generated for given seed
+            let twap_data = TwapData::load_checked(twap_info, program_id)?;
+            let twap_10min = twap_data.get_twap_10min();
+            let cur_price = Self::calculate_price(total_pc_without_take_pnl, total_coin_without_take_pnl, &amm);
+
+            dynamic_fee = TwapData::calculate_dynamic_fee(twap_10min, cur_price);
+        }
+        
+        // use dynamic fee instead of static fee
         // swap_in_after_add_fee * (1 - 0.0025) = swap_in_before_add_fee
         // swap_in_after_add_fee = swap_in_before_add_fee / (1 - 0.0025)
         let swap_in_after_add_fee = swap_in_before_add_fee
-            .checked_mul(amm.fees.swap_fee_denominator.into())
+            .checked_mul(100.into())
             .unwrap()
             .checked_ceil_div(
-                (amm.fees
-                    .swap_fee_denominator
-                    .checked_sub(amm.fees.swap_fee_numerator)
+                (dynamic_fee
+                    .checked_sub(100)
                     .unwrap())
                 .into(),
             )
@@ -6068,6 +6096,36 @@ impl Processor {
                 Self::process_update_config(program_id, accounts, config_args)
             }
         }
+    }
+
+    // Calculate current price from total PC and total Coin amounts
+    /// Returns the price as quote currency per base currency (PC/Coin)
+    pub fn calculate_price(
+        total_pc_without_take_pnl: u64,
+        total_coin_without_take_pnl: u64,
+        amm: &AmmInfo,
+    ) -> u64 {
+        let x = Calculator::normalize_decimal_v2(
+            total_pc_without_take_pnl,
+            amm.pc_decimals,
+            amm.sys_decimal_value,
+        );
+        let y = Calculator::normalize_decimal_v2(
+            total_coin_without_take_pnl,
+            amm.coin_decimals,
+            amm.sys_decimal_value,
+        );
+        
+        let cur_price: u64 = u64::try_from(
+            (x).checked_mul(amm.sys_decimal_value.into())
+                .unwrap()
+                .checked_div(y)
+                .unwrap()
+                .as_u128(),
+            )
+            .unwrap();
+        
+        cur_price
     }
 }
 
